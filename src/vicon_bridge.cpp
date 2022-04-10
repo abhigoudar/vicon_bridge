@@ -41,8 +41,10 @@
 #include <ros/ros.h>
 #include <tf/tf.h>
 #include <tf/transform_broadcaster.h>
+#include <tf_conversions/tf_eigen.h>
 #include <tf/transform_listener.h>
 #include <geometry_msgs/TransformStamped.h>
+#include <nav_msgs/Odometry.h>
 #include <vicon_bridge/viconGrabPose.h>
 #include <vicon_bridge/Markers.h>
 #include <vicon_bridge/Marker.h>
@@ -53,6 +55,8 @@
 
 #include <diagnostic_updater/diagnostic_updater.h>
 #include <diagnostic_updater/update_functions.h>
+
+#include <vicon_bridge/filter.h>
 
 using std::min;
 using std::max;
@@ -135,13 +139,18 @@ class SegmentPublisher
 {
 public:
   ros::Publisher pub;
+  ros::Publisher odom_pub;
   bool is_ready;
   tf::Transform calibration_pose;
   bool calibrated;
+  vicon_odom::KalmanFilter kf_;
+  Eigen::Matrix3d R_prev;
+
   SegmentPublisher() :
     is_ready(false), calibration_pose(tf::Pose::getIdentity()),
         calibrated(false)
   {
+    R_prev = Eigen::Matrix3d::Identity();
   }
   ;
 };
@@ -163,6 +172,7 @@ private:
   string host_name_;
   string tf_ref_frame_id_;
   string tracked_frame_suffix_;
+  string child_frame_id_;
   // Publisher
   ros::Publisher marker_pub_;
   // TF Broadcaster
@@ -170,6 +180,7 @@ private:
   //geometry_msgs::PoseStamped vicon_pose;
   tf::Transform flyer_transform;
   ros::Time now_time;
+  ros::Time last_time;
   // TODO: Make the following configurable:
   ros::ServiceServer m_grab_vicon_pose_service_server;
   ros::ServiceServer calibrate_segment_server_;
@@ -185,6 +196,7 @@ private:
   bool unlabeled_marker_data_enabled;
 
   bool broadcast_tf_, publish_tf_, publish_markers_;
+  bool publish_odometry_;
 
   bool grab_frames_;
   // boost::thread grab_frames_thread_;
@@ -194,6 +206,7 @@ private:
   std::vector<std::string> time_log_;
 
   Client vicon_client_;
+  //
 
 public:
   void startGrabbing()
@@ -230,12 +243,16 @@ public:
     nh_priv.param("datastream_hostport", host_name_, host_name_);
     nh_priv.param("tf_ref_frame_id", tf_ref_frame_id_, tf_ref_frame_id_);
     nh_priv.param("broadcast_transform", broadcast_tf_, true);
+    nh_priv.param("publish_odometry", publish_odometry_, true);
     nh_priv.param("publish_transform", publish_tf_, true);
     nh_priv.param("publish_markers", publish_markers_, true);
+    nh_priv.param<std::string>("child_frame_id", child_frame_id_, "base_link");
+
     if (init_vicon() == false){
       ROS_ERROR("Error while connecting to Vicon. Exiting now.");
       return;
     }
+
     // Service Server
     ROS_INFO("setting up grab_vicon_pose service server ... ");
     m_grab_vicon_pose_service_server = nh_priv.advertiseService("grab_vicon_pose", &ViconReceiver::grabPoseCallback,
@@ -250,6 +267,7 @@ public:
     {
       marker_pub_ = nh.advertise<vicon_bridge::Markers>(tracked_frame_suffix_ + "/markers", 10);
     }
+
     startGrabbing();
   }
 
@@ -273,6 +291,38 @@ private:
     stat.add("framecount", frameCount);
     stat.add("# markers", n_markers);
     stat.add("# unlabeled markers", n_unlabeled_markers);
+  }
+
+  bool init_kf(vicon_odom::KalmanFilter& kf_)
+  {
+    double max_accel;
+    nh_priv.param("max_accel", max_accel, 5.0);
+
+    // There should only be one vicon_fps, so we read from nh
+    double dt, vicon_fps;
+    nh_priv.param("vicon_fps", vicon_fps, 100.0);
+    ROS_ASSERT(vicon_fps > 0.0);
+    dt = 1 / vicon_fps;
+
+    // Initialize KalmanFilter
+    vicon_odom::KalmanFilter::State_t proc_noise_diag;
+    proc_noise_diag(0) = 0.5 * max_accel * dt * dt;
+    proc_noise_diag(1) = 0.5 * max_accel * dt * dt;
+    proc_noise_diag(2) = 0.5 * max_accel * dt * dt;
+    proc_noise_diag(3) = max_accel * dt;
+    proc_noise_diag(4) = max_accel * dt;
+    proc_noise_diag(5) = max_accel * dt;
+    proc_noise_diag = proc_noise_diag.array().square();
+    vicon_odom::KalmanFilter::Measurement_t meas_noise_diag;
+    meas_noise_diag(0) = 1e-4;
+    meas_noise_diag(1) = 1e-4;
+    meas_noise_diag(2) = 1e-4;
+    meas_noise_diag = meas_noise_diag.array().square();
+    kf_.initialize(vicon_odom::KalmanFilter::State_t::Zero(),
+                  0.01 * vicon_odom::KalmanFilter::ProcessCov_t::Identity(),
+                  proc_noise_diag.asDiagonal(), meas_noise_diag.asDiagonal());
+
+    return true;
   }
 
   bool init_vicon()
@@ -332,6 +382,9 @@ private:
     boost::mutex::scoped_lock lock(segments_mutex_);
     SegmentPublisher & spub = segment_publishers_[subject_name + "/" + segment_name];
 
+    if(publish_odometry_)
+      !init_kf(spub.kf_);
+
     // we don't need the lock anymore, since rest is protected by is_ready
     lock.unlock();
 
@@ -340,6 +393,12 @@ private:
       spub.pub = nh.advertise<geometry_msgs::TransformStamped>(tracked_frame_suffix_ + "/" + subject_name + "/"
                                                                                                             + segment_name, 10);
     }
+
+    if(publish_odometry_)
+    {
+      spub.odom_pub = nh.advertise<nav_msgs::Odometry>(tracked_frame_suffix_ + "/" + subject_name + "/" + segment_name + "_odom", 10);
+    }
+
     // try to get zero pose from parameter server
     string param_suffix(subject_name + "/" + segment_name + "/zero_pose/");
     double qw, qx, qy, qz, x, y, z;
@@ -408,7 +467,6 @@ private:
 
   bool process_frame()
   {
-    static ros::Time lastTime;
     Output_GetFrameNumber OutputFrameNum = vicon_client_.GetFrameNumber();
 
     //frameCount++;
@@ -437,7 +495,7 @@ private:
       freq_status_.tick();
       ros::Duration vicon_latency(vicon_client_.GetLatencyTotal().Total);
 
-      if(publish_tf_ || broadcast_tf_)
+      if(publish_tf_ || broadcast_tf_ || publish_odometry_)
       {
         process_subjects(now_time - vicon_latency);
       }
@@ -447,7 +505,7 @@ private:
         process_markers(now_time - vicon_latency, lastFrameNumber);
       }
 
-      lastTime = now_time;
+      last_time = now_time;
       return true;
     }
   }
@@ -509,6 +567,11 @@ private:
                     tf::transformStampedTFToMsg(transforms.back(), *pose_msg);
                     seg.pub.publish(pose_msg);
                   }
+                  //
+                  if(publish_odometry_)
+                  {
+                    run_kf(frame_time, transforms.back(), seg);
+                  }
                 }
               }
               else
@@ -537,6 +600,76 @@ private:
       tf_broadcaster_.sendTransform(transforms);
     }
     cnt++;
+  }
+
+  void run_kf(const ros::Time& frame_time, const tf::StampedTransform& tf_,
+    SegmentPublisher& seg)
+  {
+    double dt = (now_time - last_time).toSec();
+    // This is based on the assumption that typical VICON
+    // update rate is around 100Hz to 200Hz.
+    if(dt < 1e-6)
+      return;
+
+    Eigen::Vector3d translation;
+    Eigen::Quaterniond rotation;
+    tf::vectorTFToEigen(tf_.getOrigin(), translation);
+    tf::quaternionTFToEigen(tf_.getRotation(), rotation);
+
+    // Kalman filter for getting translational velocity from position measurements
+    seg.kf_.processUpdate(dt);
+    const vicon_odom::KalmanFilter::Measurement_t meas(translation[0], translation[1], 
+      translation[2]);
+
+    // static ros::Time t_last_meas = msg->header.stamp;
+    // double meas_dt = (msg->header.stamp - t_last_meas).toSec();
+    // t_last_meas = msg->header.stamp;
+    seg.kf_.measurementUpdate(meas, dt);
+
+    const vicon_odom::KalmanFilter::State_t state = seg.kf_.getState();
+    const vicon_odom::KalmanFilter::ProcessCov_t proc_noise = seg.kf_.getProcessNoise();
+
+    nav_msgs::Odometry odom_msg;
+    odom_msg.header.frame_id = "map"; // TODO: Figure this out
+    odom_msg.header.stamp = frame_time;
+    odom_msg.child_frame_id = child_frame_id_;
+    odom_msg.pose.pose.position.x = state(0);
+    odom_msg.pose.pose.position.y = state(1);
+    odom_msg.pose.pose.position.z = state(2);
+    odom_msg.twist.twist.linear.x = state(3);
+    odom_msg.twist.twist.linear.y = state(4);
+    odom_msg.twist.twist.linear.z = state(5);
+    for(int i = 0; i < 3; i++)
+    {
+      for(int j = 0; j < 3; j++)
+      {
+        odom_msg.pose.covariance[6 * i + j] = proc_noise(i, j);
+        odom_msg.twist.covariance[6 * i + j] = proc_noise(3 + i, 3 + j);
+      }
+    }
+
+    odom_msg.pose.pose.orientation.w = rotation.w();
+    odom_msg.pose.pose.orientation.x = rotation.x();
+    odom_msg.pose.pose.orientation.y = rotation.y();
+    odom_msg.pose.pose.orientation.z = rotation.z();
+
+    // Single step differentitation for angular velocity
+    static Eigen::Matrix3d R_prev(Eigen::Matrix3d::Identity());
+    Eigen::Matrix3d R(rotation);
+
+    if(dt > 1e-6)
+    {
+      const Eigen::Matrix3d R_dot = (R - seg.R_prev) / dt;
+      const Eigen::Matrix3d w_hat = R_dot * R.transpose();
+
+      odom_msg.twist.twist.angular.x = w_hat(2, 1);
+      odom_msg.twist.twist.angular.y = w_hat(0, 2);
+      odom_msg.twist.twist.angular.z = w_hat(1, 0);
+    }
+    
+    seg.R_prev = R;
+    //
+    seg.odom_pub.publish(odom_msg);
   }
 
   void process_markers(const ros::Time& frame_time, unsigned int vicon_frame_num)

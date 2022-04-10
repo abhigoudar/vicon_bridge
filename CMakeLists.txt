@@ -7,12 +7,16 @@ find_package(catkin REQUIRED COMPONENTS
     message_generation
     dynamic_reconfigure
     geometry_msgs
+    nav_msgs
     roscpp
     tf
+    tf_conversions
     diagnostic_updater
 )
 
 find_package(Boost REQUIRED COMPONENTS thread date_time)
+
+find_package(Eigen3 REQUIRED)
 
 # Generate messages and services
 add_message_files(FILES
@@ -41,6 +45,8 @@ catkin_package(CATKIN_DEPENDS
 )
 
 include_directories(
+    include
+    ${EIGEN3_INCLUDE_DIRS}
     ${catkin_INCLUDE_DIRS}
     ${Boost_INCLUDE_DIRS}
     vicon_sdk/DataStream  # For Vicon SDK
@@ -54,6 +60,7 @@ target_link_libraries(vicon_sdk PUBLIC ${Boost_LIBRARIES})
 
 add_executable(vicon_bridge
     src/vicon_bridge.cpp
+    src/filter.cpp
 )
 target_link_libraries(vicon_bridge
     vicon_sdk
@@ -71,6 +78,7 @@ add_dependencies(tf_distort ${PROJECT_NAME}_gencpp ${PROJECT_NAME}_gencfg)
 
 add_executable(testclient src/ViconDataStreamSDK_CPPTest.cpp)
 target_link_libraries(testclient vicon_sdk)
+
 
 # Install
 install(TARGETS vicon_sdk vicon_bridge calibrate tf_distort testclient
