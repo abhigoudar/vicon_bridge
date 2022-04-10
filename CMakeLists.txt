@@ -7,8 +7,10 @@ find_package(catkin REQUIRED COMPONENTS
     message_generation
     dynamic_reconfigure
     geometry_msgs
+    nav_msgs
     roscpp
     tf
+    tf_conversions
     diagnostic_updater
 )
 
@@ -41,6 +43,7 @@ catkin_package(CATKIN_DEPENDS
 )
 
 include_directories(
+    include
     ${catkin_INCLUDE_DIRS}
     ${Boost_INCLUDE_DIRS}
     vicon_sdk/DataStream  # For Vicon SDK

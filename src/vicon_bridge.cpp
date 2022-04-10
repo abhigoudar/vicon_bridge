@@ -42,7 +42,9 @@
 #include <tf/tf.h>
 #include <tf/transform_broadcaster.h>
 #include <tf/transform_listener.h>
+#include <tf_conversions/tf_eigen.h>
 #include <geometry_msgs/TransformStamped.h>
+#include <nav_msgs/Odometry.h>
 #include <vicon_bridge/viconGrabPose.h>
 #include <vicon_bridge/Markers.h>
 #include <vicon_bridge/Marker.h>
@@ -53,6 +55,8 @@
 
 #include <diagnostic_updater/diagnostic_updater.h>
 #include <diagnostic_updater/update_functions.h>
+
+#include <vicon_bridge/odom_utils.h>
 
 using std::min;
 using std::max;
@@ -134,10 +138,15 @@ string Adapt(const Result::Enum i_result)
 class SegmentPublisher
 {
 public:
-  ros::Publisher pub;
+  ros::Publisher tf_pub;
+  ros::Publisher odom_pub;
   bool is_ready;
   tf::Transform calibration_pose;
   bool calibrated;
+  Pose prev_pose;
+  std::shared_ptr<MovingWindowFilter<Eigen::Vector3d>> lin_vel_filter;
+  std::shared_ptr<MovingWindowFilter<Eigen::Vector3d>> ang_vel_filter;
+
   SegmentPublisher() :
     is_ready(false), calibration_pose(tf::Pose::getIdentity()),
         calibrated(false)
@@ -163,6 +172,8 @@ private:
   string host_name_;
   string tf_ref_frame_id_;
   string tracked_frame_suffix_;
+  string robot_frame_id_;
+  string map_frame_id_;
   // Publisher
   ros::Publisher marker_pub_;
   // TF Broadcaster
@@ -180,11 +191,13 @@ private:
   unsigned int frame_datum;
   unsigned int n_markers;
   unsigned int n_unlabeled_markers;
+  int filter_window_size;
   bool segment_data_enabled;
   bool marker_data_enabled;
   bool unlabeled_marker_data_enabled;
 
   bool broadcast_tf_, publish_tf_, publish_markers_;
+  bool publish_odom_;
 
   bool grab_frames_;
   // boost::thread grab_frames_thread_;
@@ -231,7 +244,13 @@ public:
     nh_priv.param("tf_ref_frame_id", tf_ref_frame_id_, tf_ref_frame_id_);
     nh_priv.param("broadcast_transform", broadcast_tf_, true);
     nh_priv.param("publish_transform", publish_tf_, true);
+    nh_priv.param("publish_odom", publish_odom_, true);
     nh_priv.param("publish_markers", publish_markers_, true);
+    nh_priv.param<string>("map_frame_id", map_frame_id_, "map");
+    nh_priv.param<string>("robot_frame_id", robot_frame_id_, "base_link");
+    nh_priv.param<int>("filter_window_size", filter_window_size, 3);
+    ROS_INFO("Moving window filter size:[%d]", filter_window_size);
+
     if (init_vicon() == false){
       ROS_ERROR("Error while connecting to Vicon. Exiting now.");
       return;
@@ -337,8 +356,15 @@ private:
 
     if(publish_tf_)
     {
-      spub.pub = nh.advertise<geometry_msgs::TransformStamped>(tracked_frame_suffix_ + "/" + subject_name + "/"
-                                                                                                            + segment_name, 10);
+      spub.tf_pub = nh.advertise<geometry_msgs::TransformStamped>(tracked_frame_suffix_ + "/" +
+        subject_name + "/" + segment_name, 10);
+    }
+    if(publish_odom_)
+    {
+      spub.odom_pub = nh.advertise<nav_msgs::Odometry>(tracked_frame_suffix_ + "/" +
+        subject_name + "/" + segment_name + "_odom", 10);
+      spub.lin_vel_filter = std::make_shared<MovingWindowFilter<Eigen::Vector3d>>(filter_window_size);
+      spub.ang_vel_filter = std::make_shared<MovingWindowFilter<Eigen::Vector3d>>(filter_window_size);
     }
     // try to get zero pose from parameter server
     string param_suffix(subject_name + "/" + segment_name + "/zero_pose/");
@@ -452,6 +478,63 @@ private:
     }
   }
 
+  void publish_odometry(SegmentPublisher& seg, const Pose& curr_pose)
+  {
+    double dt = curr_pose.stamp - seg.prev_pose.stamp;
+    if(dt < 1e-6)
+    {
+        ROS_WARN("[%s]: Timestep too shrot.ignoring", 
+            ros::this_node::getName().c_str());
+        seg.prev_pose.reset();
+    }
+
+    Eigen::Vector3d v_ = seg.prev_pose.ori.conjugate() *(
+        curr_pose.pos - seg.prev_pose.pos)/dt;
+    Eigen::Vector3d w_ = quaternionLog(seg.prev_pose.ori.conjugate() *
+        curr_pose.ori)/dt;
+
+    seg.lin_vel_filter->push(v_);
+    seg.ang_vel_filter->push(w_);
+
+    const Eigen::Vector3d mv = seg.lin_vel_filter->mean();
+    const Eigen::Vector3d mw = seg.ang_vel_filter->mean();
+
+    if(mv.norm() > 50 || mw.norm() > 50)
+    {
+        ROS_INFO("Large spike detected. Resetting");
+        seg.lin_vel_filter->reset();
+        seg.ang_vel_filter->reset();
+        return;
+    }
+
+    nav_msgs::Odometry out_msg;
+    out_msg.header.stamp = ros::Time(curr_pose.stamp);
+    out_msg.header.frame_id = map_frame_id_;
+    out_msg.child_frame_id = robot_frame_id_;
+    out_msg.pose.pose.position.x = curr_pose.pos[0];
+    out_msg.pose.pose.position.y = curr_pose.pos[1];
+    out_msg.pose.pose.position.z = curr_pose.pos[2];
+    out_msg.pose.pose.orientation.x = curr_pose.ori.x();
+    out_msg.pose.pose.orientation.y = curr_pose.ori.y();
+    out_msg.pose.pose.orientation.z = curr_pose.ori.z();
+    out_msg.pose.pose.orientation.w = curr_pose.ori.w();
+    out_msg.twist.twist.linear.x = mv[0];
+    out_msg.twist.twist.linear.y = mv[1];
+    out_msg.twist.twist.linear.z = mv[2];
+    out_msg.twist.twist.angular.x = mw[0];
+    out_msg.twist.twist.angular.y = mw[1];
+    out_msg.twist.twist.angular.z = mw[2];
+
+    for(int i = 0; i < 36; i++)
+    {
+        out_msg.pose.covariance[i] = (i%7 == 0) ?
+            0.0000001 : 0;
+        out_msg.twist.covariance[i] = (i%7 == 0) ?
+            0.0000001 : 0;
+    }
+    seg.odom_pub.publish(out_msg);
+  }
+
   void process_subjects(const ros::Time& frame_time)
   {
     string tracked_frame, subject_name, segment_name;
@@ -507,7 +590,20 @@ private:
                   if(publish_tf_)
                   {
                     tf::transformStampedTFToMsg(transforms.back(), *pose_msg);
-                    seg.pub.publish(pose_msg);
+                    seg.tf_pub.publish(pose_msg);
+                  }
+
+                  if(publish_odom_)
+                  {
+                    static Pose curr_pose;
+                    curr_pose.stamp = frame_time.toSec();
+                    tf::vectorTFToEigen(transforms.back().getOrigin(), curr_pose.pos);
+                    tf::quaternionTFToEigen(transforms.back().getRotation(), curr_pose.ori);
+
+                    if(seg.prev_pose.stamp > 0)
+                      publish_odometry(seg, curr_pose);
+
+                    seg.prev_pose = curr_pose;
                   }
                 }
               }
