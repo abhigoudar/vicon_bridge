@@ -11,7 +11,11 @@
 		<param name="stream_mode" value="ServerPush"/>
     <param name="datastream_hostport" value="$(arg datastream_hostport)"/>
 		<param name="tf_ref_frame_id" value="$(arg vicon_world_frame)"/>
-    <param name="filter_window_size" value="20"/>
+    <param name="filter_window_size" value="5"/>
+    <param name="max_lin_vel" value="10"/> <!-- m/s-->
+    <param name="max_ang_vel" value="6.28"/> <!-- rad/s-->
+    <param name="max_lin_vel_factor" value="1000"/>
+    <param name="max_ang_vel_factor" value="1000"/>
 	</node>
 
 </launch>

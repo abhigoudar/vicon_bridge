@@ -196,6 +196,11 @@ private:
   bool marker_data_enabled;
   bool unlabeled_marker_data_enabled;
 
+  double max_lin_vel;
+  double max_ang_vel;
+  double max_lin_vel_factor;
+  double max_ang_vel_factor;
+
   bool broadcast_tf_, publish_tf_, publish_markers_;
   bool publish_odom_;
 
@@ -248,8 +253,18 @@ public:
     nh_priv.param("publish_markers", publish_markers_, true);
     nh_priv.param<string>("map_frame_id", map_frame_id_, "map");
     nh_priv.param<string>("robot_frame_id", robot_frame_id_, "base_link");
+
+    // filter parameters
     nh_priv.param<int>("filter_window_size", filter_window_size, 3);
+    nh_priv.param<int>("max_lin_vel", max_lin_vel, 10); // m/s
+    nh_priv.param<int>("max_ang_vel", max_ang_vel, 6.28); // rad/s
+    nh_priv.param<int>("max_lin_vel_factor", max_lin_vel_factor, 1000);
+    nh_priv.param<int>("max_ang_vel_factor", max_ang_vel_factor, 1000);
     ROS_INFO("Moving window filter size:[%d]", filter_window_size);
+    ROS_INFO("Moving window filter: max_lin_vel:[%f]", max_lin_vel);
+    ROS_INFO("Moving window filter: max_ang_vel:[%f]", max_ang_vel);
+    ROS_INFO("Moving window filter: max_lin_vel_factor[%f]", max_lin_vel_factor);
+    ROS_INFO("Moving window filter: max_ang_vel_factor[%f]", max_ang_vel_factor);
 
     if (init_vicon() == false){
       ROS_ERROR("Error while connecting to Vicon. Exiting now.");
@@ -493,19 +508,30 @@ private:
     Eigen::Vector3d w_ = quaternionLog(seg.prev_pose.ori.conjugate() *
         curr_pose.ori)/dt;
 
+    // simple outlier rejection
+    if(seg.lin_vel_filter->windowSize() >= filter_window_size &&
+       (v_.norm() > seg.lin_vel_filter->mean().norm() * max_lin_vel_factor ||
+        v_.norm() > max_lin_vel)
+    {
+        ROS_WARN("Large lin vel spike detected. Curr:[%f] meas:[%f]",
+          seg.lin_vel_filter->mean().norm(), v_.norm());
+        return;
+    }
+
+    if(seg.ang_vel_filter->windowSize() >= filter_window_size &&
+       (w_.norm() > seg.ang_vel_filter->mean().norm() * max_ang_vel_factor ||
+        w_.norm() > max_ang_vel)
+    {
+        ROS_WARN("Large ang vel spike detected. Curr:[%f] meas:[%f]",
+          seg.ang_vel_filter->mean().norm(), w_.norm());
+        return;
+    }
+
     seg.lin_vel_filter->push(v_);
     seg.ang_vel_filter->push(w_);
 
     const Eigen::Vector3d mv = seg.lin_vel_filter->mean();
     const Eigen::Vector3d mw = seg.ang_vel_filter->mean();
-
-    if(mv.norm() > 50 || mw.norm() > 50)
-    {
-        ROS_INFO("Large spike detected. Resetting");
-        seg.lin_vel_filter->reset();
-        seg.ang_vel_filter->reset();
-        return;
-    }
 
     nav_msgs::Odometry out_msg;
     out_msg.header.stamp = ros::Time(curr_pose.stamp);

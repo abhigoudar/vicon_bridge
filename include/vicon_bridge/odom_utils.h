@@ -73,6 +73,11 @@ public:
 
     void push(const T& datum);
 
+    const int windowSize()
+    {
+      return (int)window.size();
+    }
+
 private:
 
     T sum;
